@@ -4,14 +4,15 @@
 A fast Python wrapper around Lua and LuaJIT2.
 """
 
-from __future__ import absolute_import
+# from __future__ import absolute_import
 
 cimport cython
 
-from lupa cimport lua
+cimport lua
 from .lua cimport lua_State
 
 cimport cpython.ref
+cimport cpython.bytes
 cimport cpython.tuple
 cimport cpython.float
 cimport cpython.long
@@ -47,7 +48,10 @@ except ImportError:
     import builtins
 
 DEF POBJECT = "POBJECT" # as used by LunaticPython
+DEF LUPACACHE = "__LUPA_CACHE__"
+DEF LUPAERRFUNC   = "__LUPA_ERRFUNC__"
 
+cdef class _LuaObject
 
 cdef enum WrappedObjectFlags:
     # flags that determine the behaviour of a wrapped object:
@@ -67,11 +71,13 @@ include "lock.pxi"
 class LuaError(Exception):
     """Base class for errors in the Lua runtime.
     """
+    pass
 
 
 class LuaSyntaxError(LuaError):
     """Syntax error in Lua code.
     """
+    pass
 
 
 def lua_type(obj):
@@ -186,14 +192,14 @@ cdef class LuaRuntime:
     cdef object _attribute_setter
     cdef bint _unpack_returned_tuples
 
+    cdef bint _register_eval
+    cdef bint _register_builtins
+
     def __cinit__(self, encoding='UTF-8', source_encoding=None,
                   attribute_filter=None, attribute_handlers=None,
                   bint register_eval=True, bint unpack_returned_tuples=False,
-                  bint register_builtins=True):
-        cdef lua_State* L = lua.luaL_newstate()
-        if L is NULL:
-            raise LuaError("Failed to initialise Lua runtime")
-        self._state = L
+                  bint register_builtins=True):        
+        self._state = NULL
         self._lock = FastRLock()
         self._pyrefs_in_lua = {}
         self._encoding = _asciiOrNone(encoding)
@@ -202,6 +208,8 @@ cdef class LuaRuntime:
             raise ValueError("attribute_filter must be callable")
         self._attribute_filter = attribute_filter
         self._unpack_returned_tuples = unpack_returned_tuples
+        self._register_eval = register_eval
+        self._register_builtins = register_builtins
 
         if attribute_handlers:
             raise_error = False
@@ -217,16 +225,36 @@ cdef class LuaRuntime:
                 raise ValueError("attribute_handlers must be a sequence of two callables")
             if attribute_filter and (getter is not None or setter is not None):
                 raise ValueError("attribute_filter and attribute_handlers are mutually exclusive")
-            self._attribute_getter, self._attribute_setter = getter, setter
+            self._attribute_getter, self._attribute_setter = getter, setter        
 
+    cdef initWithNewState(self):
+        cdef lua_State* L = lua.luaL_newstate()
+        if L is NULL:
+            raise LuaError("Failed to initialise Lua runtime")
+        self.initWithState( L )
+
+    cdef initWithState(self, lua_State* L):
+        if L is NULL:
+            raise LuaError("Failed to initialise Lua runtime")
+        self._state = L
         lua.luaL_openlibs(L)
-        self.init_python_lib(register_eval, register_builtins)
+        self.init_python_lib( self._register_eval, self._register_builtins )
         lua.lua_settop(L, 0)
-        lua.lua_atpanic(L, <lua.lua_CFunction>1)
+        # lua.lua_atpanic(L, <lua.lua_CFunction>1)
 
+        #create object conversion cache
+        lua.lua_createtable( L, 0, 0 )
+        # lua.lua_createtable( L, 0, 1 ) #metatable {__mode = 'v'}
+        # lua.lua_pushstring( L, 'v' )
+        # lua.lua_setfield( L, -2, '__mode' )
+        # lua.lua_setmetatable( L, -2 ) #setmetatable ( cache, mt )
+        lua.lua_setfield(L, lua.LUA_REGISTRYINDEX, LUPACACHE) #save to registry table
+
+    cdef destroy(self):
+        self._state = NULL #state will be closed by true owner
+    
     def __dealloc__(self):
         if self._state is not NULL:
-            lua.lua_close(self._state)
             self._state = NULL
 
     @cython.final
@@ -470,7 +498,6 @@ cdef inline void unlock_runtime(LuaRuntime runtime) nogil:
 ################################################################################
 # Lua object wrappers
 
-@cython.internal
 @cython.no_gc_clear
 @cython.freelist(16)
 cdef class _LuaObject:
@@ -484,7 +511,7 @@ cdef class _LuaObject:
         raise TypeError("Type cannot be instantiated manually")
 
     def __dealloc__(self):
-        if self._runtime is None:
+        if self._runtime is None or self._runtime._state ==NULL :
             return
         cdef lua_State* L = self._state
         try:
@@ -492,6 +519,15 @@ cdef class _LuaObject:
             locked = True
         except:
             locked = False
+
+        #remove from cache
+        lua.lua_getfield(L, lua.LUA_REGISTRYINDEX, LUPACACHE)
+        self.push_lua_object()
+        lua.lua_pushnil(L)
+        lua.lua_settable(L, -3)
+        lua.lua_pop(L, 1)
+
+        #remove ref
         lua.luaL_unref(L, lua.LUA_REGISTRYINDEX, self._ref)
         if locked:
             unlock_runtime(self._runtime)
@@ -617,9 +653,27 @@ cdef class _LuaObject:
             lua.lua_settop(L, old_top)
             unlock_runtime(self._runtime)
 
+cdef _LuaObject find_cached_lua_object(lua_State* L, int n):
+    #check cache first
+    if n < 0 :
+        n = lua.lua_gettop(L) + n + 1
+    lua.lua_getfield( L, lua.LUA_REGISTRYINDEX, LUPACACHE )
+    lua.lua_pushvalue( L, n )
+    lua.lua_gettable( L, -2 )
+    lua_type = lua.lua_type(L, -1)
+    if lua_type in (lua.LUA_TUSERDATA, lua.LUA_TLIGHTUSERDATA):
+        obj = <_LuaObject> lua.lua_touserdata(L,-1)
+        lua.lua_pop( L, 2 )
+        return obj
+    lua.lua_pop( L, 2 )
+    return None
 
 cdef _LuaObject new_lua_object(LuaRuntime runtime, lua_State* L, int n):
-    cdef _LuaObject obj = _LuaObject.__new__(_LuaObject)
+    cdef _LuaObject obj
+    obj = find_cached_lua_object( L, n )
+    if obj: return obj
+    #create new luaobject
+    obj = _LuaObject.__new__(_LuaObject)
     init_lua_object(obj, runtime, L, n)
     return obj
 
@@ -627,7 +681,15 @@ cdef void init_lua_object(_LuaObject obj, LuaRuntime runtime, lua_State* L, int 
     obj._runtime = runtime
     obj._state = L
     lua.lua_pushvalue(L, n)
+    #insert into cache
+    lua.lua_getfield(L, lua.LUA_REGISTRYINDEX, LUPACACHE)
+    lua.lua_pushvalue(L, -2)
+    lua.lua_pushlightuserdata(L, < void* >obj)
+    lua.lua_settable(L, -3)
+    lua.lua_pop( L, 1 ) #pop cache table 
+    #save to registry
     obj._ref = lua.luaL_ref(L, lua.LUA_REGISTRYINDEX)
+
 
 cdef object lua_object_repr(lua_State* L, encoding):
     cdef bytes py_bytes
@@ -640,6 +702,7 @@ cdef object lua_object_repr(lua_State* L, encoding):
         ptr = <void*>lua.lua_tothread(L, -1)
     else:
         ptr = NULL
+        
     if ptr:
         py_bytes = PyBytes_FromFormat(
             "<Lua %s at %p>", lua.lua_typename(L, lua_type), ptr)
@@ -654,7 +717,6 @@ cdef object lua_object_repr(lua_State* L, encoding):
 
 
 @cython.final
-@cython.internal
 @cython.no_gc_clear
 cdef class _LuaTable(_LuaObject):
     def __iter__(self):
@@ -740,12 +802,15 @@ cdef class _LuaTable(_LuaObject):
 
 
 cdef _LuaTable new_lua_table(LuaRuntime runtime, lua_State* L, int n):
-    cdef _LuaTable obj = _LuaTable.__new__(_LuaTable)
+    cdef _LuaTable obj 
+    obj = <_LuaTable> find_cached_lua_object( L, n )
+    if obj: return obj
+    #create new
+    obj= _LuaTable.__new__(_LuaTable)
     init_lua_object(obj, runtime, L, n)
     return obj
 
 
-@cython.internal
 @cython.no_gc_clear
 cdef class _LuaFunction(_LuaObject):
     """A Lua function (which may become a coroutine).
@@ -778,13 +843,16 @@ cdef class _LuaFunction(_LuaObject):
             unlock_runtime(self._runtime)
 
 cdef _LuaFunction new_lua_function(LuaRuntime runtime, lua_State* L, int n):
-    cdef _LuaFunction obj = _LuaFunction.__new__(_LuaFunction)
+    cdef _LuaFunction obj 
+    obj = <_LuaFunction> find_cached_lua_object( L, n )
+    if obj: return obj
+    #create new one
+    obj = _LuaFunction.__new__(_LuaFunction)
     init_lua_object(obj, runtime, L, n)
     return obj
 
 
 @cython.final
-@cython.internal
 @cython.no_gc_clear
 cdef class _LuaCoroutineFunction(_LuaFunction):
     """A function that returns a new coroutine when called.
@@ -793,13 +861,16 @@ cdef class _LuaCoroutineFunction(_LuaFunction):
         return self.coroutine(*args)
 
 cdef _LuaCoroutineFunction new_lua_coroutine_function(LuaRuntime runtime, lua_State* L, int n):
-    cdef _LuaCoroutineFunction obj = _LuaCoroutineFunction.__new__(_LuaCoroutineFunction)
+    cdef _LuaCoroutineFunction obj 
+    obj = <_LuaCoroutineFunction> find_cached_lua_object( L, n )
+    if obj: return obj
+    #create new one
+    obj = _LuaCoroutineFunction.__new__(_LuaCoroutineFunction)
     init_lua_object(obj, runtime, L, n)
     return obj
 
 
 @cython.final
-@cython.internal
 @cython.no_gc_clear   # FIXME: get rid if this
 cdef class _LuaThread(_LuaObject):
     """A Lua thread (coroutine).
@@ -845,7 +916,11 @@ cdef class _LuaThread(_LuaObject):
         return False
 
 cdef _LuaThread new_lua_thread(LuaRuntime runtime, lua_State* L, int n):
-    cdef _LuaThread obj = _LuaThread.__new__(_LuaThread)
+    cdef _LuaThread obj 
+    obj = <_LuaThread> find_cached_lua_object( L, n )
+    if obj: return obj
+    #create new one
+    obj = _LuaThread.__new__(_LuaThread)
     init_lua_object(obj, runtime, L, n)
     obj._co_state = lua.lua_tothread(L, n)
     return obj
@@ -1047,6 +1122,9 @@ cdef object py_from_lua(LuaRuntime runtime, lua_State *L, int n):
     cdef const_char_ptr s
     cdef lua.lua_Number number
     cdef py_object* py_obj
+
+    if n < 0 :
+        n = lua.lua_gettop(L) + n + 1
     cdef int lua_type = lua.lua_type(L, n)
 
     if lua_type == lua.LUA_TNIL:
@@ -1253,16 +1331,31 @@ cdef call_lua(LuaRuntime runtime, lua_State *L, tuple args):
 
 cdef object execute_lua_call(LuaRuntime runtime, lua_State *L, Py_ssize_t nargs):
     cdef int result_status
-    # call into Lua
-    with nogil:
-        result_status = lua.lua_pcall(L, nargs, lua.LUA_MULTRET, 0)
-    runtime.reraise_on_exception()
-    if result_status:
-        raise_lua_error(runtime, L, result_status)
-    return unpack_lua_results(runtime, L)
+    cdef int errIdx
+    try:
+        # call into Lua
+        with nogil:
+            errIdx = lua.lua_gettop( L ) - nargs;
+            lua.lua_getfield( L, lua.LUA_REGISTRYINDEX, LUPAERRFUNC )
+            if lua.lua_isnil( L, -1 ):
+                lua.lua_pop( L, 1 )
+                result_status = lua.lua_pcall( L, nargs, lua.LUA_MULTRET, 0 )
+            else:
+                lua.lua_insert( L, errIdx )
+                result_status = lua.lua_pcall( L, nargs, lua.LUA_MULTRET, errIdx )
+                lua.lua_remove( L, errIdx )
+
+        if result_status:
+            raise_lua_error(runtime, L, result_status)
+        runtime.reraise_on_exception()
+            
+        return unpack_lua_results(runtime, L)
+    finally:
+        lua.lua_settop(L, 0)
 
 cdef int push_lua_arguments(LuaRuntime runtime, lua_State *L,
                             tuple args, bint first_may_be_nil=True) except -1:
+
     cdef int i
     if args:
         old_top = lua.lua_gettop(L)
@@ -1604,6 +1697,12 @@ cdef int py_enumerate(lua_State* L) nogil:
         return lua.luaL_error(L, 'error creating an iterator with enumerate()')  # never returns!
     return result
 
+cdef int py_seterrfunc(lua_State* L) nogil:
+    if not lua.lua_isfunction( L, 1 ):
+        lua.luaL_argerror(L, 1, "lua function expected")
+    lua.lua_pushvalue( L, 1 )
+    lua.lua_setfield( L, lua.LUA_REGISTRYINDEX, LUPAERRFUNC )
+    return 0
 
 cdef int py_enumerate_with_gil(lua_State* L, py_object* py_obj, double start) with gil:
     cdef LuaRuntime runtime
@@ -1686,11 +1785,12 @@ cdef int py_iter_next_with_gil(lua_State* L, py_object* py_iter) with gil:
 
 # 'python' module functions in Lua
 
-cdef lua.luaL_Reg py_lib[7]
+cdef lua.luaL_Reg py_lib[8]
 py_lib[0] = lua.luaL_Reg(name = "as_attrgetter", func = <lua.lua_CFunction> py_as_attrgetter)
 py_lib[1] = lua.luaL_Reg(name = "as_itemgetter", func = <lua.lua_CFunction> py_as_itemgetter)
-py_lib[2] = lua.luaL_Reg(name = "as_function", func = <lua.lua_CFunction> py_as_function)
-py_lib[3] = lua.luaL_Reg(name = "iter", func = <lua.lua_CFunction> py_iter)
-py_lib[4] = lua.luaL_Reg(name = "iterex", func = <lua.lua_CFunction> py_iterex)
-py_lib[5] = lua.luaL_Reg(name = "enumerate", func = <lua.lua_CFunction> py_enumerate)
-py_lib[6] = lua.luaL_Reg(name = NULL, func = NULL)
+py_lib[2] = lua.luaL_Reg(name = "as_function",   func = <lua.lua_CFunction> py_as_function)
+py_lib[3] = lua.luaL_Reg(name = "iter",          func = <lua.lua_CFunction> py_iter)
+py_lib[4] = lua.luaL_Reg(name = "iterex",        func = <lua.lua_CFunction> py_iterex)
+py_lib[5] = lua.luaL_Reg(name = "enumerate",     func = <lua.lua_CFunction> py_enumerate)
+py_lib[6] = lua.luaL_Reg(name = "seterrfunc",    func = <lua.lua_CFunction> py_seterrfunc)
+py_lib[7] = lua.luaL_Reg(name = NULL,            func = NULL)
